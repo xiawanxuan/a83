@@ -141,6 +141,22 @@ class TimeSeriesBucket:
 
 
 @dataclass
+class MongoShardChunkInfo:
+    shard_name: str
+    chunk_count: int = 0
+    estimated_size_bytes: int = 0
+    size_limit_bytes: Optional[int] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "shard_name": self.shard_name,
+            "chunk_count": self.chunk_count,
+            "estimated_size_bytes": self.estimated_size_bytes,
+            "size_limit_bytes": self.size_limit_bytes,
+        }
+
+
+@dataclass
 class MongoCollectionMetadata:
     collection_name: str
     is_time_series: bool = False
@@ -153,6 +169,12 @@ class MongoCollectionMetadata:
     buckets: List[TimeSeriesBucket] = field(default_factory=list)
     is_sharded: bool = False
     shard_key: Optional[Dict[str, int]] = None
+    document_count: int = 0
+    avg_document_size_bytes: int = 0
+    storage_size_bytes: int = 0
+    index_size_bytes: int = 0
+    total_size_bytes: int = 0
+    shard_chunks: List[MongoShardChunkInfo] = field(default_factory=list)
 
     def get_field(self, name: str) -> Optional[MongoFieldInfo]:
         for f in self.fields:
@@ -179,6 +201,12 @@ class MongoCollectionMetadata:
             "buckets": [b.to_dict() for b in self.buckets],
             "is_sharded": self.is_sharded,
             "shard_key": self.shard_key,
+            "document_count": self.document_count,
+            "avg_document_size_bytes": self.avg_document_size_bytes,
+            "storage_size_bytes": self.storage_size_bytes,
+            "index_size_bytes": self.index_size_bytes,
+            "total_size_bytes": self.total_size_bytes,
+            "shard_chunks": [sc.to_dict() for sc in self.shard_chunks],
         }
 
 
@@ -441,6 +469,43 @@ class MetadataCollector:
                     metadata.is_sharded = True
                     shard_key_info = stats.get("shardKey", {})
                     metadata.shard_key = shard_key_info
+                    shards_data = stats.get("shards", {})
+                    default_chunk_size = self.config.get_chunk_size_bytes()
+                    for shard_name, shard_stats in shards_data.items():
+                        chunk_count = 0
+                        estimated_size = 0
+                        if isinstance(shard_stats, dict):
+                            estimated_size = (
+                                shard_stats.get("storageSize", 0)
+                                + shard_stats.get("totalIndexSize", 0)
+                            )
+                            ns = f"{db.name}.{collection_name}"
+                            try:
+                                chunks = db.client["config"]["chunks"]
+                                chunk_count = chunks.count_documents({
+                                    "ns": ns, "shard": shard_name
+                                })
+                                if chunk_count == 0:
+                                    chunk_count = shard_stats.get("numOrphanDocs", 0)
+                                    if chunk_count > 0 and metadata.avg_document_size_bytes:
+                                        chunk_count = max(1, estimated_size // default_chunk_size)
+                            except Exception:
+                                pass
+                            if chunk_count == 0 and default_chunk_size > 0:
+                                chunk_count = max(1, estimated_size // default_chunk_size)
+                        else:
+                            estimated_size = int(shard_stats) if isinstance(shard_stats, (int, float)) else 0
+                        metadata.shard_chunks.append(MongoShardChunkInfo(
+                            shard_name=shard_name,
+                            chunk_count=chunk_count,
+                            estimated_size_bytes=estimated_size,
+                            size_limit_bytes=None,
+                        ))
+                metadata.document_count = int(stats.get("count", 0))
+                metadata.avg_document_size_bytes = int(stats.get("avgObjSize", 0))
+                metadata.storage_size_bytes = int(stats.get("storageSize", 0))
+                metadata.index_size_bytes = int(stats.get("totalIndexSize", 0))
+                metadata.total_size_bytes = metadata.storage_size_bytes + metadata.index_size_bytes
             except Exception:
                 pass
 
@@ -448,6 +513,45 @@ class MetadataCollector:
         except Exception as e:
             print(f"Error collecting metadata for collection {collection_name}: {e}")
             return None
+
+    def collect_mongo_storage_overview(self) -> Dict[str, Any]:
+        db = self.mongo.get_database()
+        overview: Dict[str, Any] = {"database": db.name}
+        try:
+            db_stats = db.command("dbStats")
+            overview.update({
+                "collections_count": int(db_stats.get("collections", 0)),
+                "objects_count": int(db_stats.get("objects", 0)),
+                "avg_obj_size_bytes": int(db_stats.get("avgObjSize", 0)),
+                "data_size_bytes": int(db_stats.get("dataSize", 0)),
+                "storage_size_bytes": int(db_stats.get("storageSize", 0)),
+                "indexes_count": int(db_stats.get("indexes", 0)),
+                "index_size_bytes": int(db_stats.get("indexSize", 0)),
+                "total_size_bytes": int(db_stats.get("totalSize", db_stats.get("storageSize", 0))),
+                "fs_used_size_bytes": int(db_stats.get("fsUsedSize", 0)),
+                "fs_total_size_bytes": int(db_stats.get("fsTotalSize", 0)),
+            })
+        except Exception:
+            pass
+        try:
+            shard_list: List[Dict[str, Any]] = []
+            try:
+                shards = list(db.client["config"]["shards"].find({}))
+                for s in shards:
+                    host = s.get("host", "")
+                    sid = s.get("_id", s.get("id", ""))
+                    max_size = s.get("maxSize")
+                    shard_list.append({
+                        "shard_id": str(sid),
+                        "host": host,
+                        "max_size_bytes": int(max_size) if max_size else None,
+                    })
+            except Exception:
+                pass
+            overview["shards"] = shard_list
+        except Exception:
+            pass
+        return overview
 
     def collect_all(self) -> Dict[str, Any]:
         return {

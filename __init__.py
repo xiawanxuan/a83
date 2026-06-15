@@ -24,6 +24,7 @@ from .metadata_collector import (
     MongoFieldInfo,
     MongoIndexInfo,
     TimeSeriesBucket,
+    MongoShardChunkInfo,
 )
 from .diff_engine import (
     DiffEngine,
@@ -37,6 +38,12 @@ from .sync_executor import (
     SyncScriptGenerator,
     SyncPlan,
     SyncOperation,
+)
+from .storage_validator import (
+    StorageValidator,
+    StorageValidationResult,
+    CollectionStorageForecast,
+    ShardStorageStatus,
 )
 from .rollback_manager import (
     ChangeLogger,
@@ -61,6 +68,7 @@ __all__ = [
     "MongoFieldInfo",
     "MongoIndexInfo",
     "TimeSeriesBucket",
+    "MongoShardChunkInfo",
     "DiffEngine",
     "TableCollectionDiff",
     "FieldDiff",
@@ -70,6 +78,10 @@ __all__ = [
     "SyncScriptGenerator",
     "SyncPlan",
     "SyncOperation",
+    "StorageValidator",
+    "StorageValidationResult",
+    "CollectionStorageForecast",
+    "ShardStorageStatus",
     "ChangeLogger",
     "RollbackManager",
     "SyncRunLog",

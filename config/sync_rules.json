@@ -97,5 +97,20 @@
     "log_filename_pattern": "sync_%Y%m%d_%H%M%S.log",
     "max_log_size_mb": 100,
     "backup_count": 30
+  },
+  "storage_validation": {
+    "enabled": true,
+    "enforcement_mode": "block",
+    "allow_override_arg": true,
+    "default_chunk_size_mb": 64,
+    "disk_usage_warning_threshold": 0.80,
+    "disk_usage_block_threshold": 0.95,
+    "index_overhead_multiplier": 1.35,
+    "migration_overhead_multiplier": 1.5,
+    "per_collection_max_size_mb": null,
+    "shard_capacity_overrides_mb": {
+      "shard01": null,
+      "shard02": null
+    }
   }
 }

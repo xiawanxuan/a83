@@ -9,6 +9,7 @@ from db_adapters import MongoDBAdapter, PostgreSQLAdapter
 from diff_engine import DiffEngine, TableCollectionDiff
 from metadata_collector import MetadataCollector, MongoCollectionMetadata, TableMetadata
 from rollback_manager import ChangeLogger, RollbackManager, SyncPhase, SyncStatus
+from storage_validator import StorageValidationResult, StorageValidator
 from sync_executor import SyncExecutor, SyncPlan, SyncScriptGenerator
 
 
@@ -37,6 +38,7 @@ class SmartManufacturingSync:
         self.metadata_collector = MetadataCollector(
             self.pg_adapter, self.mongo_adapter, self.config_manager
         )
+        self.storage_validator = StorageValidator(self.config_manager)
         self.diff_engine = DiffEngine(self.config_manager)
         self.script_generator = SyncScriptGenerator(self.config_manager)
         self.sync_executor = SyncExecutor(
@@ -69,6 +71,7 @@ class SmartManufacturingSync:
         self,
         run_mode: Optional[str] = None,
         export_scripts: bool = True,
+        force_bypass_storage: bool = False,
     ) -> int:
         mode = (run_mode or self.config_manager.sync_config.run_mode).lower()
         run_id = self.logger.start_run(run_mode=mode)
@@ -81,6 +84,11 @@ class SmartManufacturingSync:
             pg_tables: List[TableMetadata] = self.metadata_collector.collect_pg_tables()
             mongo_colls: List[MongoCollectionMetadata] = self.metadata_collector.collect_mongo_collections()
             snapshot = self.metadata_collector.collect_all()
+            try:
+                mongo_storage_overview = self.metadata_collector.collect_mongo_storage_overview()
+            except Exception as storage_e:
+                mongo_storage_overview = {"error": str(storage_e)}
+                snapshot["mongodb_storage"] = mongo_storage_overview
             self.logger.record_metadata_snapshot(snapshot)
             self.logger.complete_phase(details={
                 "pg_tables_collected": len(pg_tables),
@@ -98,6 +106,50 @@ class SmartManufacturingSync:
                 return 0
 
             self.logger.complete_phase(details={"diffs_found": len(diffs)})
+
+            self.logger.start_phase(SyncPhase.STORAGE_VALIDATION)
+            validation_result: StorageValidationResult = (
+                self.storage_validator.run_validation(
+                    diffs=diffs,
+                    pg_tables=pg_tables,
+                    mongo_colls=mongo_colls,
+                    storage_overview=mongo_storage_overview,
+                )
+            )
+            report_text = validation_result.format_human_readable()
+            for line in report_text.splitlines():
+                self.logger.info(line)
+            self.logger.complete_phase(details=validation_result.to_dict())
+
+            allow_override = (
+                self.config_manager.get_allow_override()
+                and force_bypass_storage
+                and mode == "execute"
+            )
+
+            if not validation_result.passed and not allow_override:
+                enforcement = validation_result.enforcement
+                if enforcement == "block" or mode == "execute":
+                    self.logger.warning(
+                        f"容量校验未通过({validation_result.overall_level.upper()}), "
+                        f"已拦截本次同步。使用 --force 可在确认风险后强制执行。"
+                    )
+                    self.logger.complete_run(
+                        SyncStatus.FAILED,
+                        error=(
+                            "存储容量校验拦截: "
+                            + "; ".join(validation_result.blocking_reasons)
+                        ),
+                    )
+                    return 2
+                else:
+                    self.logger.warning(
+                        "容量校验存在警告，但 enforcement=warn_only，将继续执行。"
+                    )
+            elif allow_override and not validation_result.passed:
+                self.logger.warning(
+                    "检测到 --force 参数，已绕过存储容量拦截继续执行，请确认磁盘空间充足。"
+                )
 
             self.logger.start_phase(SyncPhase.SCRIPT_GENERATE)
             plan: SyncPlan = self.script_generator.generate_from_diffs(diffs)
@@ -301,6 +353,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Do not export SQL/MongoShell scripts to files",
     )
+    sync_parser.add_argument(
+        "--force",
+        action="store_true",
+        dest="force_storage",
+        help="绕过存储容量校验拦截（仅在已确认磁盘空间充足时使用）",
+    )
 
     diff_parser = subparsers.add_parser("diff", help="Show differences without generating scripts")
     diff_parser.add_argument(
@@ -368,6 +426,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             return sync_app.run_sync(
                 run_mode=args.mode,
                 export_scripts=not args.no_export,
+                force_bypass_storage=getattr(args, "force_storage", False),
             )
         elif args.command == "diff":
             return sync_app.show_diff(limit=args.limit)

@@ -26,6 +26,7 @@ class SyncConfig:
     whitelist: Dict[str, Any] = field(default_factory=dict)
     table_collection_mappings: List[TableCollectionMapping] = field(default_factory=list)
     logging_config: Dict[str, Any] = field(default_factory=dict)
+    storage_validation: Dict[str, Any] = field(default_factory=dict)
 
 
 class ConfigManager:
@@ -62,6 +63,7 @@ class ConfigManager:
             whitelist=self.config.get("whitelist", {"enabled": False, "tables": [], "collections": []}),
             table_collection_mappings=mappings,
             logging_config=self.config.get("logging", {}),
+            storage_validation=self.config.get("storage_validation", {}),
         )
 
     def get_sync_config(self) -> SyncConfig:
@@ -205,3 +207,52 @@ class ConfigManager:
                 errors.append("time_series_config.time_field is required")
 
         return errors
+
+    def get_chunk_size_bytes(self) -> int:
+        default = 64 * 1024 * 1024
+        raw = self.sync_config.storage_validation.get("default_chunk_size_mb", 64)
+        try:
+            return int(raw) * 1024 * 1024
+        except (TypeError, ValueError):
+            return default
+
+    def is_storage_validation_enabled(self) -> bool:
+        return bool(self.sync_config.storage_validation.get("enabled", True))
+
+    def get_disk_usage_warning_threshold(self) -> float:
+        return float(self.sync_config.storage_validation.get("disk_usage_warning_threshold", 0.80))
+
+    def get_disk_usage_block_threshold(self) -> float:
+        return float(self.sync_config.storage_validation.get("disk_usage_block_threshold", 0.95))
+
+    def get_index_overhead_multiplier(self) -> float:
+        return float(self.sync_config.storage_validation.get("index_overhead_multiplier", 1.35))
+
+    def get_migration_overhead_multiplier(self) -> float:
+        return float(self.sync_config.storage_validation.get("migration_overhead_multiplier", 1.5))
+
+    def get_per_collection_max_size_bytes(self) -> Optional[int]:
+        raw = self.sync_config.storage_validation.get("per_collection_max_size_mb")
+        if raw is None:
+            return None
+        try:
+            return int(raw) * 1024 * 1024
+        except (TypeError, ValueError):
+            return None
+
+    def get_enforcement_mode(self) -> str:
+        return self.sync_config.storage_validation.get("enforcement_mode", "block").lower()
+
+    def get_allow_override(self) -> bool:
+        return bool(self.sync_config.storage_validation.get("allow_override_arg", True))
+
+    def get_storage_capacity_overrides(self) -> Dict[str, int]:
+        result: Dict[str, int] = {}
+        raw = self.sync_config.storage_validation.get("shard_capacity_overrides_mb", {})
+        if isinstance(raw, dict):
+            for shard_name, size_mb in raw.items():
+                try:
+                    result[str(shard_name)] = int(size_mb) * 1024 * 1024
+                except (TypeError, ValueError):
+                    continue
+        return result
