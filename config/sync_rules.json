@@ -1,0 +1,101 @@
+{
+  "sync_direction": "bidirectional",
+  "run_mode": "preview",
+  "auto_rollback_on_failure": true,
+  "type_mapping": {
+    "postgresql_to_mongodb": {
+      "integer": "int",
+      "bigint": "long",
+      "smallint": "int",
+      "serial": "int",
+      "bigserial": "long",
+      "numeric": "decimal",
+      "decimal": "decimal",
+      "real": "double",
+      "double precision": "double",
+      "character varying": "string",
+      "varchar": "string",
+      "character": "string",
+      "char": "string",
+      "text": "string",
+      "boolean": "bool",
+      "timestamp without time zone": "date",
+      "timestamp with time zone": "date",
+      "date": "date",
+      "time without time zone": "string",
+      "time with time zone": "string",
+      "json": "object",
+      "jsonb": "object",
+      "uuid": "string",
+      "bytea": "binData",
+      "ARRAY": "array"
+    },
+    "mongodb_to_postgresql": {
+      "int": "integer",
+      "long": "bigint",
+      "double": "double precision",
+      "decimal": "numeric",
+      "string": "varchar(255)",
+      "bool": "boolean",
+      "date": "timestamp with time zone",
+      "object": "jsonb",
+      "array": "jsonb",
+      "binData": "bytea",
+      "objectId": "uuid",
+      "timestamp": "timestamp with time zone"
+    }
+  },
+  "time_series_config": {
+    "time_field": "measurement_time",
+    "meta_field": "metadata",
+    "granularity": "seconds",
+    "bucket_max_span_seconds": 3600,
+    "bucket_ranges": [
+      { "from": "2020-01-01", "to": "2021-01-01", "bucket_size": "1d" },
+      { "from": "2021-01-01", "to": "2022-01-01", "bucket_size": "1h" },
+      { "from": "2022-01-01", "to": "2099-12-31", "bucket_size": "5m" }
+    ]
+  },
+  "index_rules": {
+    "auto_create_compound_indexes": true,
+    "default_index_prefix": "idx_",
+    "exclude_field_patterns": ["^_id$", "^id$"],
+    "recommended_indexes": [
+      { "fields": ["device_id", "measurement_time"], "unique": false },
+      { "fields": ["measurement_time"], "unique": false }
+    ]
+  },
+  "blacklist": {
+    "tables": ["schema_migrations", "flyway_schema_history", "django_migrations"],
+    "fields": ["created_at", "updated_at", "_v", "_etag"]
+  },
+  "whitelist": {
+    "enabled": false,
+    "tables": [],
+    "collections": []
+  },
+  "table_collection_mappings": [
+    {
+      "pg_table": "device_measurements",
+      "mongo_collection": "device_measurements_ts",
+      "sync_fields": true,
+      "sync_indexes": true,
+      "sync_sharding": true
+    },
+    {
+      "pg_table": "production_metrics",
+      "mongo_collection": "production_metrics_ts",
+      "sync_fields": true,
+      "sync_indexes": true,
+      "sync_sharding": true
+    }
+  ],
+  "logging": {
+    "level": "INFO",
+    "log_to_file": true,
+    "log_directory": "logs",
+    "log_filename_pattern": "sync_%Y%m%d_%H%M%S.log",
+    "max_log_size_mb": 100,
+    "backup_count": 30
+  }
+}

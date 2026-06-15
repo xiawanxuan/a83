@@ -1,0 +1,65 @@
+# ============================================================
+# 智能制造数据中台 - PostgreSQL / MongoDB 双向同步 Crontab 示例
+# ============================================================
+#
+# 使用方法:
+#   1. 将本文件内容复制到系统 crontab (crontab -e)
+#   2. 或使用: crontab /path/to/crontab.example
+#   3. 修改 WORK_DIR 和 PYTHON_BIN 为实际路径
+#
+# 运行模式说明:
+#   preview  - 仅生成同步脚本, 不执行变更 (建议先用此模式验证)
+#   execute  - 实际执行数据库同步变更 (生产环境使用前务必先 preview)
+#
+# 日志位置: logs/ 目录下
+# ============================================================
+
+# ----- 环境配置 (根据实际情况修改) -----
+WORK_DIR=/opt/smart_manufacturing_sync
+PYTHON_BIN=/usr/bin/python3
+VENV_PYTHON=/opt/smart_manufacturing_sync/.venv/bin/python
+CONFIG_FILE=/opt/smart_manufacturing_sync/config/sync_rules.json
+DB_INI=/opt/smart_manufacturing_sync/config/database.ini
+
+# 设置 PATH 和 HOME
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+MAILTO=admin@example.com
+
+# ============================================================
+# 方案 1: 每天凌晨 2:00 执行完整同步 (推荐生产环境)
+#   - 先在 PREVIEW 模式运行，生成脚本供审核
+#   - 如果一切正常，后续可改为 EXECUTE 模式
+# ============================================================
+
+# 每天凌晨 2:00  - PREVIEW 模式 (生成脚本，不执行)
+0 2 * * * cd /opt/smart_manufacturing_sync && /opt/smart_manufacturing_sync/.venv/bin/python main.py sync --mode preview --config /opt/smart_manufacturing_sync/config/sync_rules.json --db-ini /opt/smart_manufacturing_sync/config/database.ini >> /opt/smart_manufacturing_sync/logs/cron_preview.log 2>&1
+
+# 每天凌晨 2:15  - EXECUTE 模式 (实际执行同步，需人工确认后启用)
+# 15 2 * * * cd /opt/smart_manufacturing_sync && /opt/smart_manufacturing_sync/.venv/bin/python main.py sync --mode execute --config /opt/smart_manufacturing_sync/config/sync_rules.json --db-ini /opt/smart_manufacturing_sync/config/database.ini >> /opt/smart_manufacturing_sync/logs/cron_execute.log 2>&1
+
+# ============================================================
+# 方案 2: 每小时执行一次同步 (变更频繁的场景)
+# ============================================================
+
+# 每小时第 5 分钟 - PREVIEW 模式
+# 5 * * * * cd /opt/smart_manufacturing_sync && /opt/smart_manufacturing_sync/.venv/bin/python main.py sync --mode preview >> /opt/smart_manufacturing_sync/logs/cron_hourly.log 2>&1
+
+# 每小时第 15 分钟 - EXECUTE 模式 (需谨慎)
+# 15 * * * * cd /opt/smart_manufacturing_sync && /opt/smart_manufacturing_sync/.venv/bin/python main.py sync --mode execute >> /opt/smart_manufacturing_sync/logs/cron_hourly_execute.log 2>&1
+
+# ============================================================
+# 方案 3: 工作日 (周一至周五) 每 30 分钟同步
+# ============================================================
+
+# */30 * * * 1-5 cd /opt/smart_manufacturing_sync && /opt/smart_manufacturing_sync/.venv/bin/python main.py sync --mode execute >> /opt/smart_manufacturing_sync/logs/cron_workday.log 2>&1
+
+# ============================================================
+# 每周一早上 8:30 发送同步报告 (示例, 需要安装 mail/mutt)
+# ============================================================
+# 30 8 * * 1 echo "Weekly sync report attached" | mailx -a /opt/smart_manufacturing_sync/logs/cron_preview.log -s "Sync Weekly Report" admin@example.com
+
+# ============================================================
+# 日志定期清理 (保留最近 30 天日志)
+# ============================================================
+0 3 * * * find /opt/smart_manufacturing_sync/logs -type f \( -name "*.log" -o -name "*.json" -o -name "*.sql" -o -name "*.js" \) -mtime +30 -delete >> /opt/smart_manufacturing_sync/logs/log_cleanup.log 2>&1
