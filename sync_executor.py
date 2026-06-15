@@ -339,7 +339,14 @@ class SyncScriptGenerator:
         table = diff.pg_table
         if idx.action == "add_index":
             unique = "UNIQUE" if idx.is_unique else ""
-            cols_sql = ", ".join(idx.columns)
+            cols_parts = []
+            for i, col in enumerate(idx.columns):
+                direction = idx.column_directions[i] if i < len(idx.column_directions) else "ASC"
+                if direction == "DESC":
+                    cols_parts.append(f"{col} DESC")
+                else:
+                    cols_parts.append(col)
+            cols_sql = ", ".join(cols_parts)
             sql = f"CREATE {unique} INDEX IF NOT EXISTS {idx.index_name} ON {table} ({cols_sql});"
             rollback = f"DROP INDEX IF EXISTS {idx.index_name};"
             plan.add_operation(SyncOperation(
@@ -355,7 +362,14 @@ class SyncScriptGenerator:
         elif idx.action == "drop_index":
             sql = f"DROP INDEX IF EXISTS {idx.index_name};"
             unique = "UNIQUE" if idx.is_unique else ""
-            cols_sql = ", ".join(idx.columns)
+            cols_parts = []
+            for i, col in enumerate(idx.columns):
+                direction = idx.column_directions[i] if i < len(idx.column_directions) else "ASC"
+                if direction == "DESC":
+                    cols_parts.append(f"{col} DESC")
+                else:
+                    cols_parts.append(col)
+            cols_sql = ", ".join(cols_parts)
             rollback = f"CREATE {unique} INDEX {idx.index_name} ON {table} ({cols_sql});"
             plan.add_operation(SyncOperation(
                 id=self._next_id(),
@@ -367,11 +381,63 @@ class SyncScriptGenerator:
                 rollback_sql=rollback,
                 diff_ref=idx,
             ))
+        elif idx.action == "modify_index":
+            change = idx.extra.get("change", "")
+            cols_parts = []
+            for i, col in enumerate(idx.columns):
+                direction = idx.column_directions[i] if i < len(idx.column_directions) else "ASC"
+                if direction == "DESC":
+                    cols_parts.append(f"{col} DESC")
+                else:
+                    cols_parts.append(col)
+            cols_sql = ", ".join(cols_parts)
+
+            drop_sql = f"DROP INDEX IF EXISTS {idx.index_name};"
+            unique = "UNIQUE" if idx.is_unique else ""
+            create_sql = f"CREATE {unique} INDEX IF NOT EXISTS {idx.index_name} ON {table} ({cols_sql});"
+            sql = f"{drop_sql}\n{create_sql}"
+
+            rollback_parts = []
+            current_sig = idx.extra.get("current_sig", [])
+            for col_dir in current_sig:
+                col_name, direction = col_dir
+                if direction == "DESC":
+                    rollback_parts.append(f"{col_name} DESC")
+                else:
+                    rollback_parts.append(col_name)
+            rb_cols = ", ".join(rollback_parts)
+            was_unique = idx.extra.get("change") != "add_uniqueness"
+            rb_unique = "UNIQUE" if was_unique else ""
+            rollback = f"DROP INDEX IF EXISTS {idx.index_name};\nCREATE {rb_unique} INDEX {idx.index_name} ON {table} ({rb_cols});"
+
+            op_type = "MODIFY_INDEX"
+            if change == "direction_mismatch":
+                op_type = "MODIFY_INDEX_DIRECTION"
+            elif change == "add_uniqueness":
+                op_type = "MODIFY_INDEX_ADD_UNIQUE"
+            elif change == "remove_uniqueness":
+                op_type = "MODIFY_INDEX_REMOVE_UNIQUE"
+
+            plan.add_operation(SyncOperation(
+                id=self._next_id(),
+                order=0,
+                target_db="postgresql",
+                operation_type=op_type,
+                object_name=f"{table}.{idx.index_name}",
+                sql_script=sql,
+                rollback_sql=rollback,
+                diff_ref=idx,
+            ))
 
     def _mongo_index_op(self, diff: TableCollectionDiff, idx: IndexDiff, plan: SyncPlan) -> None:
         coll = diff.mongo_collection
         if idx.action == "add_index":
-            keys_obj = "{" + ", ".join([f"'{c}': 1" for c in idx.columns]) + "}"
+            keys_parts = []
+            for i, col in enumerate(idx.columns):
+                direction = idx.column_directions[i] if i < len(idx.column_directions) else "ASC"
+                direction_val = -1 if direction == "DESC" else 1
+                keys_parts.append(f"'{col}': {direction_val}")
+            keys_obj = "{" + ", ".join(keys_parts) + "}"
             options_parts = []
             if idx.is_unique:
                 options_parts.append("unique: true")
@@ -394,7 +460,12 @@ class SyncScriptGenerator:
             ))
         elif idx.action == "drop_index":
             mongo_script = f"db.{coll}.dropIndex('{idx.index_name}');"
-            keys_obj = "{" + ", ".join([f"'{c}': 1" for c in idx.columns]) + "}"
+            keys_parts = []
+            for i, col in enumerate(idx.columns):
+                direction = idx.column_directions[i] if i < len(idx.column_directions) else "ASC"
+                direction_val = -1 if direction == "DESC" else 1
+                keys_parts.append(f"'{col}': {direction_val}")
+            keys_obj = "{" + ", ".join(keys_parts) + "}"
             options_str = f"name: '{idx.index_name}'"
             if idx.is_unique:
                 options_str = "unique: true, " + options_str
@@ -404,6 +475,56 @@ class SyncScriptGenerator:
                 order=0,
                 target_db="mongodb",
                 operation_type="DROP_INDEX",
+                object_name=f"{coll}.{idx.index_name}",
+                mongo_script=mongo_script,
+                rollback_mongo=rollback,
+                diff_ref=idx,
+            ))
+        elif idx.action == "modify_index":
+            change = idx.extra.get("change", "")
+            drop_script = f"db.{coll}.dropIndex('{idx.index_name}');"
+
+            keys_parts = []
+            for i, col in enumerate(idx.columns):
+                direction = idx.column_directions[i] if i < len(idx.column_directions) else "ASC"
+                direction_val = -1 if direction == "DESC" else 1
+                keys_parts.append(f"'{col}': {direction_val}")
+            keys_obj = "{" + ", ".join(keys_parts) + "}"
+            options_parts = []
+            if idx.is_unique:
+                options_parts.append("unique: true")
+            options_parts.append(f"name: '{idx.index_name}'")
+            options_str = ", ".join(options_parts)
+            create_script = f"db.{coll}.createIndex({keys_obj}, {{ {options_str} }});"
+
+            mongo_script = f"{drop_script}\n{create_script}"
+
+            current_sig = idx.extra.get("current_sig", [])
+            rb_keys_parts = []
+            for col_dir in current_sig:
+                col_name, direction = col_dir
+                direction_val = -1 if direction == "DESC" else 1
+                rb_keys_parts.append(f"'{col_name}': {direction_val}")
+            rb_keys_obj = "{" + ", ".join(rb_keys_parts) + "}"
+            was_unique = change != "add_uniqueness"
+            rb_options = f"name: '{idx.index_name}'"
+            if was_unique:
+                rb_options = "unique: true, " + rb_options
+            rollback = f"db.{coll}.dropIndex('{idx.index_name}');\ndb.{coll}.createIndex({rb_keys_obj}, {{ {rb_options} }});"
+
+            op_type = "MODIFY_INDEX"
+            if change == "direction_mismatch":
+                op_type = "MODIFY_INDEX_DIRECTION"
+            elif change == "add_uniqueness":
+                op_type = "MODIFY_INDEX_ADD_UNIQUE"
+            elif change == "remove_uniqueness":
+                op_type = "MODIFY_INDEX_REMOVE_UNIQUE"
+
+            plan.add_operation(SyncOperation(
+                id=self._next_id(),
+                order=0,
+                target_db="mongodb",
+                operation_type=op_type,
                 object_name=f"{coll}.{idx.index_name}",
                 mongo_script=mongo_script,
                 rollback_mongo=rollback,
@@ -443,6 +564,54 @@ class SyncScriptGenerator:
                     diff_ref=sd,
                 ))
 
+            if sd.action == "modify_bucket_range" and sd.target_db_type == "mongodb":
+                coll = diff.mongo_collection
+                from_date = sd.extra.get("from", "")
+                to_date = sd.extra.get("to", "")
+                current_size = sd.extra.get("current_size", "")
+                expected_size = sd.extra.get("expected_size", "")
+                mongo_script = (
+                    f"// WARNING: MongoDB time series bucket ranges are immutable.\n"
+                    f"// Collection '{coll}' bucket range [{from_date} -> {to_date}]:\n"
+                    f"//   current bucket_size: {current_size}\n"
+                    f"//   expected bucket_size: {expected_size}\n"
+                    f"// Action required: migrate data to a new collection with updated bucket configuration.\n"
+                    f"// Step 1: Create new collection with correct bucket size\n"
+                    f"// Step 2: Migrate data with $merge or $out\n"
+                    f"// Step 3: Drop old collection and rename\n"
+                )
+                plan.add_operation(SyncOperation(
+                    id=self._next_id(),
+                    order=0,
+                    target_db="mongodb",
+                    operation_type="MODIFY_BUCKET_RANGE",
+                    object_name=f"{coll}[{from_date}:{to_date}]",
+                    mongo_script=mongo_script,
+                    rollback_mongo="",
+                    diff_ref=sd,
+                ))
+
+            if sd.action == "remove_bucket_range" and sd.target_db_type == "mongodb":
+                coll = diff.mongo_collection
+                from_date = sd.extra.get("from", "")
+                to_date = sd.extra.get("to", "")
+                table_name = f"{coll}_{from_date.replace('-', '')}"
+                mongo_script = f"db.{table_name}.drop();"
+                bucket_size = sd.extra.get("bucket_size", "")
+                rollback = (
+                    f"// Recreate bucket view for '{coll}' [{from_date} -> {to_date}] with bucket_size={bucket_size}"
+                )
+                plan.add_operation(SyncOperation(
+                    id=self._next_id(),
+                    order=0,
+                    target_db="mongodb",
+                    operation_type="REMOVE_BUCKET_VIEW",
+                    object_name=table_name,
+                    mongo_script=mongo_script,
+                    rollback_mongo=rollback,
+                    diff_ref=sd,
+                ))
+
             if sd.action == "add_partition_key" and sd.target_db_type == "postgresql":
                 table = diff.pg_table
                 time_field = sd.extra.get("time_field", "measurement_time")
@@ -458,6 +627,207 @@ class SyncScriptGenerator:
                     rollback_sql=rollback,
                     diff_ref=sd,
                 ))
+
+            if sd.action == "collection_type_mismatch" and sd.target_db_type == "mongodb":
+                coll = diff.mongo_collection
+                time_field = sd.extra.get("expected_time_field", "timestamp")
+                meta_field = sd.extra.get("expected_meta_field", "metadata")
+                granularity = sd.extra.get("expected_granularity", "seconds")
+                mongo_script = (
+                    f"// WARNING: Collection '{coll}' exists but is NOT a time series collection.\n"
+                    f"// Expected type: timeseries (timeField='{time_field}', metaField='{meta_field}', granularity='{granularity}')\n"
+                    f"// Current type: regular collection\n"
+                    f"// Manual action required:\n"
+                    f"//   1. Export existing data: mongoexport --collection={coll}\n"
+                    f"//   2. Drop collection: db.{coll}.drop()\n"
+                    f"//   3. Re-create as time series:\n"
+                    f"db.createCollection('{coll}', {{\n"
+                    f"  timeseries: {{\n"
+                    f"    timeField: '{time_field}',\n"
+                    f"    metaField: '{meta_field}',\n"
+                    f"    granularity: '{granularity}'\n"
+                    f"  }}\n"
+                    f"}});\n"
+                    f"//   4. Re-import data with correct time field mapping\n"
+                )
+                rollback = f"// Rollback: restore original collection from backup"
+                plan.add_operation(SyncOperation(
+                    id=self._next_id(),
+                    order=0,
+                    target_db="mongodb",
+                    operation_type="COLLECTION_TYPE_MISMATCH",
+                    object_name=coll,
+                    mongo_script=mongo_script,
+                    rollback_mongo=rollback,
+                    diff_ref=sd,
+                ))
+
+            if sd.action == "modify_time_field" and sd.target_db_type == "mongodb":
+                coll = diff.mongo_collection
+                current = sd.extra.get("current", "")
+                expected = sd.extra.get("expected", "")
+                mongo_script = (
+                    f"// WARNING: MongoDB time series timeField is immutable.\n"
+                    f"// Collection '{coll}' timeField: current='{current}', expected='{expected}'\n"
+                    f"// Action required: recreate collection with correct timeField.\n"
+                    f"// 1. Export data, 2. Drop, 3. Recreate, 4. Re-import with field rename\n"
+                )
+                plan.add_operation(SyncOperation(
+                    id=self._next_id(),
+                    order=0,
+                    target_db="mongodb",
+                    operation_type="MODIFY_TIME_FIELD",
+                    object_name=coll,
+                    mongo_script=mongo_script,
+                    rollback_mongo="",
+                    diff_ref=sd,
+                ))
+
+            if sd.action == "modify_meta_field" and sd.target_db_type == "mongodb":
+                coll = diff.mongo_collection
+                current = sd.extra.get("current", "")
+                expected = sd.extra.get("expected", "")
+                mongo_script = (
+                    f"// WARNING: MongoDB time series metaField is immutable.\n"
+                    f"// Collection '{coll}' metaField: current='{current}', expected='{expected}'\n"
+                    f"// Action required: recreate collection with correct metaField.\n"
+                    f"// 1. Export data, 2. Drop, 3. Recreate, 4. Re-import with field rename\n"
+                )
+                plan.add_operation(SyncOperation(
+                    id=self._next_id(),
+                    order=0,
+                    target_db="mongodb",
+                    operation_type="MODIFY_META_FIELD",
+                    object_name=coll,
+                    mongo_script=mongo_script,
+                    rollback_mongo="",
+                    diff_ref=sd,
+                ))
+
+            if sd.action == "modify_granularity" and sd.target_db_type == "mongodb":
+                coll = diff.mongo_collection
+                current = sd.extra.get("current", "")
+                expected = sd.extra.get("expected", "")
+                mongo_script = (
+                    f"db.runCommand({{\n"
+                    f"  collMod: '{coll}',\n"
+                    f"  timeseries: {{ granularity: '{expected}' }}\n"
+                    f"}});"
+                )
+                rollback = (
+                    f"db.runCommand({{\n"
+                    f"  collMod: '{coll}',\n"
+                    f"  timeseries: {{ granularity: '{current}' }}\n"
+                    f"}});"
+                )
+                plan.add_operation(SyncOperation(
+                    id=self._next_id(),
+                    order=0,
+                    target_db="mongodb",
+                    operation_type="MODIFY_GRANULARITY",
+                    object_name=coll,
+                    mongo_script=mongo_script,
+                    rollback_mongo=rollback,
+                    diff_ref=sd,
+                ))
+
+            if sd.action == "modify_bucket_span" and sd.target_db_type == "mongodb":
+                coll = diff.mongo_collection
+                current = sd.extra.get("current", 3600)
+                expected = sd.extra.get("expected", 3600)
+                mongo_script = (
+                    f"db.runCommand({{\n"
+                    f"  collMod: '{coll}',\n"
+                    f"  timeseries: {{ bucketMaxSpanSeconds: {expected} }}\n"
+                    f"}});"
+                )
+                rollback = (
+                    f"db.runCommand({{\n"
+                    f"  collMod: '{coll}',\n"
+                    f"  timeseries: {{ bucketMaxSpanSeconds: {current} }}\n"
+                    f"}});"
+                )
+                plan.add_operation(SyncOperation(
+                    id=self._next_id(),
+                    order=0,
+                    target_db="mongodb",
+                    operation_type="MODIFY_BUCKET_SPAN",
+                    object_name=coll,
+                    mongo_script=mongo_script,
+                    rollback_mongo=rollback,
+                    diff_ref=sd,
+                ))
+
+            if sd.action == "shard_key_mismatch" and sd.target_db_type == "mongodb":
+                coll = diff.mongo_collection
+                current = sd.extra.get("current", {})
+                expected = sd.extra.get("expected", {})
+                mongo_script = (
+                    f"// WARNING: Shard key change requires collection recreation.\n"
+                    f"// Collection '{coll}' shard key: current={current}, expected={expected}\n"
+                    f"// Action required:\n"
+                    f"// 1. Disable balancer: sh.stopBalancer()\n"
+                    f"// 2. Export data, 3. Drop collection, 4. Re-create with correct shard key:\n"
+                    f"// sh.shardCollection('db.{coll}', {expected})\n"
+                    f"// 5. Re-import data, 6. Re-enable balancer\n"
+                )
+                plan.add_operation(SyncOperation(
+                    id=self._next_id(),
+                    order=0,
+                    target_db="mongodb",
+                    operation_type="SHARD_KEY_MISMATCH",
+                    object_name=coll,
+                    mongo_script=mongo_script,
+                    rollback_mongo="",
+                    diff_ref=sd,
+                ))
+
+            if sd.action == "create_time_partitions" and sd.target_db_type == "postgresql":
+                table = diff.pg_table
+                time_field = sd.extra.get("time_field", "measurement_time")
+                partition_ranges = sd.extra.get("partition_ranges", [])
+                sql_parts = []
+                rollback_parts = []
+                for pr in partition_ranges:
+                    from_d = pr.get("from", "")
+                    to_d = pr.get("to", "")
+                    part_name = f"{table}_{from_d.replace('-', '')}"
+                    sql_parts.append(
+                        f"CREATE TABLE IF NOT EXISTS {part_name} PARTITION OF {table}\n"
+                        f"    FOR VALUES FROM ('{from_d}') TO ('{to_d}');"
+                    )
+                    rollback_parts.append(f"DROP TABLE IF EXISTS {part_name};")
+                sql = "\n".join(sql_parts)
+                rollback = "\n".join(rollback_parts)
+                plan.add_operation(SyncOperation(
+                    id=self._next_id(),
+                    order=0,
+                    target_db="postgresql",
+                    operation_type="CREATE_TIME_PARTITIONS",
+                    object_name=table,
+                    sql_script=sql,
+                    rollback_sql=rollback,
+                    diff_ref=sd,
+                ))
+
+            if sd.action == "add_shard_key_index" and sd.target_db_type == "postgresql":
+                table = diff.pg_table
+                shard_fields = sd.extra.get("shard_fields", [])
+                if shard_fields:
+                    cols_sql = ", ".join(shard_fields)
+                    idx_name = f"idx_{table}_{'_'.join(shard_fields)}"
+                    sql = f"CREATE INDEX IF NOT EXISTS {idx_name} ON {table} ({cols_sql});"
+                    rollback = f"DROP INDEX IF EXISTS {idx_name};"
+                    plan.add_operation(SyncOperation(
+                        id=self._next_id(),
+                        order=0,
+                        target_db="postgresql",
+                        operation_type="CREATE_SHARD_KEY_INDEX",
+                        object_name=f"{table}.{idx_name}",
+                        sql_script=sql,
+                        rollback_sql=rollback,
+                        diff_ref=sd,
+                    ))
 
 
 class SyncExecutor:

@@ -40,6 +40,7 @@ class IndexInfo:
     is_primary: bool = False
     index_type: str = "btree"
     where_clause: Optional[str] = None
+    column_directions: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -49,6 +50,7 @@ class IndexInfo:
             "is_primary": self.is_primary,
             "index_type": self.index_type,
             "where_clause": self.where_clause,
+            "column_directions": self.column_directions,
         }
 
 
@@ -275,7 +277,12 @@ class MetadataCollector:
                     ix.indisunique AS is_unique,
                     ix.indisprimary AS is_primary,
                     am.amname AS index_type,
-                    array_position(ix.indkey, a.attnum) AS col_position
+                    array_position(ix.indkey, a.attnum) AS col_position,
+                    CASE
+                        WHEN ix.indoption IS NOT NULL AND am.amname = 'btree'
+                        THEN (ix.indoption[array_position(ix.indkey, a.attnum)] & 1) = 1
+                        ELSE FALSE
+                    END AS is_desc
                 FROM pg_index ix
                 JOIN pg_class t ON t.oid = ix.indrelid
                 JOIN pg_class i ON i.oid = ix.indexrelid
@@ -299,8 +306,11 @@ class MetadataCollector:
                         "is_unique": r["is_unique"],
                         "is_primary": r["is_primary"],
                         "index_type": r["index_type"],
+                        "column_directions": [],
                     }
                 idx_map[idx_name]["columns"].append(r["column_name"])
+                is_desc = r.get("is_desc", False)
+                idx_map[idx_name]["column_directions"].append("DESC" if is_desc else "ASC")
             for idx_data in idx_map.values():
                 idx_info = IndexInfo(**idx_data)
                 metadata.indexes.append(idx_info)

@@ -39,6 +39,7 @@ class IndexDiff:
     target_db_type: str = "postgresql"
     columns: List[str] = field(default_factory=list)
     is_unique: bool = False
+    column_directions: List[str] = field(default_factory=list)
     extra: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -48,6 +49,7 @@ class IndexDiff:
             "target_db_type": self.target_db_type,
             "columns": self.columns,
             "is_unique": self.is_unique,
+            "column_directions": self.column_directions,
             "extra": self.extra,
         }
 
@@ -318,68 +320,168 @@ class DiffEngine:
         }
         return actual.lower() in compatible.get(expected.lower(), [expected.lower()])
 
+    def _make_index_signature(
+        self, columns: List[str], directions: Optional[List[str]] = None
+    ) -> tuple:
+        sig = []
+        for i, col in enumerate(columns):
+            direction = "ASC"
+            if directions and i < len(directions):
+                direction = directions[i]
+            sig.append((col, direction))
+        return tuple(sig)
+
+    def _mongo_keys_to_signature(self, keys: List[Dict[str, int]]) -> tuple:
+        sig = []
+        for key_dict in keys:
+            for field_name, direction in key_dict.items():
+                dir_str = "DESC" if direction == -1 else "ASC"
+                sig.append((field_name, dir_str))
+        return tuple(sig)
+
     def _diff_indexes_pg_to_mongo(
         self, pg: TableMetadata, mongo: Optional[MongoCollectionMetadata]
     ) -> List[IndexDiff]:
         diffs = []
-        mongo_indexes = {}
-        if mongo:
-            mongo_indexes = {idx.name: idx for idx in mongo.indexes}
 
+        mongo_sig_map: Dict[tuple, Any] = {}
+        if mongo:
+            for mi in mongo.indexes:
+                sig = self._mongo_keys_to_signature(mi.keys)
+                mongo_sig_map[sig] = mi
+
+        pg_sig_set: set = set()
         for pg_idx in pg.indexes:
             if pg_idx.is_primary:
                 continue
-            idx_name = self._normalize_index_name(pg_idx.name, pg.table_name, "mongo")
-            if idx_name not in mongo_indexes and pg_idx.name not in mongo_indexes:
-                diffs.append(IndexDiff(
-                    action="add_index",
-                    index_name=idx_name,
-                    target_db_type="mongodb",
-                    columns=list(pg_idx.columns),
-                    is_unique=pg_idx.is_unique,
-                    extra={"original_pg_name": pg_idx.name, "pg_index_type": pg_idx.index_type},
-                ))
+            pg_sig = self._make_index_signature(pg_idx.columns, pg_idx.column_directions)
+            pg_sig_set.add(pg_sig)
+
+            matching_mongo = mongo_sig_map.get(pg_sig)
+
+            if matching_mongo is None:
+                matched_by_cols = None
+                if mongo:
+                    pg_col_set = tuple(c for c, _ in pg_sig)
+                    for mi in mongo.indexes:
+                        mi_col_set = tuple(list(k.keys())[0] for k in mi.keys)
+                        if mi_col_set == pg_col_set:
+                            matched_by_cols = mi
+                            break
+
+                if matched_by_cols is not None:
+                    mi_sig = self._mongo_keys_to_signature(matched_by_cols.keys)
+                    diffs.append(IndexDiff(
+                        action="modify_index",
+                        index_name=matched_by_cols.name,
+                        target_db_type="mongodb",
+                        columns=list(pg_idx.columns),
+                        is_unique=pg_idx.is_unique,
+                        column_directions=list(pg_idx.column_directions),
+                        extra={
+                            "change": "direction_mismatch",
+                            "current_sig": list(mi_sig),
+                            "expected_sig": list(pg_sig),
+                            "original_pg_name": pg_idx.name,
+                        },
+                    ))
+                else:
+                    idx_name = self._normalize_index_name(pg_idx.name, pg.table_name, "mongo")
+                    diffs.append(IndexDiff(
+                        action="add_index",
+                        index_name=idx_name,
+                        target_db_type="mongodb",
+                        columns=list(pg_idx.columns),
+                        is_unique=pg_idx.is_unique,
+                        column_directions=list(pg_idx.column_directions),
+                        extra={"original_pg_name": pg_idx.name, "pg_index_type": pg_idx.index_type},
+                    ))
+            else:
+                if pg_idx.is_unique and not matching_mongo.is_unique:
+                    diffs.append(IndexDiff(
+                        action="modify_index",
+                        index_name=matching_mongo.name,
+                        target_db_type="mongodb",
+                        columns=list(pg_idx.columns),
+                        is_unique=True,
+                        column_directions=list(pg_idx.column_directions),
+                        extra={"change": "add_uniqueness", "original_pg_name": pg_idx.name},
+                    ))
+                elif not pg_idx.is_unique and matching_mongo.is_unique:
+                    diffs.append(IndexDiff(
+                        action="modify_index",
+                        index_name=matching_mongo.name,
+                        target_db_type="mongodb",
+                        columns=list(pg_idx.columns),
+                        is_unique=False,
+                        column_directions=list(pg_idx.column_directions),
+                        extra={"change": "remove_uniqueness", "original_pg_name": pg_idx.name},
+                    ))
 
         recommended = self.config.get_recommended_indexes()
+        recommended_sigs: set = set()
         for rec in recommended:
             rec_fields = rec.get("fields", [])
-            exists = False
-            if mongo:
-                for mi in mongo.indexes:
-                    mi_fields = [list(k.keys())[0] for k in mi.keys]
-                    if mi_fields == rec_fields:
-                        exists = True
-                        break
-            if not exists:
-                idx_name = f"idx_{pg.table_name}_{'_'.join(rec_fields)}"
-                diffs.append(IndexDiff(
-                    action="add_index",
-                    index_name=idx_name,
-                    target_db_type="mongodb",
-                    columns=rec_fields,
-                    is_unique=rec.get("unique", False),
-                    extra={"recommended": True},
-                ))
+            rec_sig = self._make_index_signature(rec_fields)
+            recommended_sigs.add(rec_sig)
+            if rec_sig in mongo_sig_map:
+                continue
+            prefix_covered = False
+            for existing_sig in mongo_sig_map:
+                if existing_sig[:len(rec_sig)] == rec_sig:
+                    prefix_covered = True
+                    break
+            if prefix_covered:
+                continue
+            idx_name = f"idx_{pg.table_name}_{'_'.join(rec_fields)}"
+            diffs.append(IndexDiff(
+                action="add_index",
+                index_name=idx_name,
+                target_db_type="mongodb",
+                columns=rec_fields,
+                is_unique=rec.get("unique", False),
+                extra={"recommended": True},
+            ))
 
         if mongo:
             for mi in mongo.indexes:
                 if mi.name.startswith("_id_"):
                     continue
-                mi_fields = [list(k.keys())[0] for k in mi.keys]
-                found = False
+                mi_sig = self._mongo_keys_to_signature(mi.keys)
+                if mi_sig in pg_sig_set:
+                    continue
+                mi_col_tuple = tuple(list(k.keys())[0] for k in mi.keys)
+                found_by_cols = False
                 for pg_idx in pg.indexes:
-                    if list(pg_idx.columns) == mi_fields:
-                        found = True
+                    if pg_idx.is_primary:
+                        continue
+                    if tuple(pg_idx.columns) == mi_col_tuple:
+                        found_by_cols = True
                         break
-                if not found:
-                    diffs.append(IndexDiff(
-                        action="drop_index",
-                        index_name=mi.name,
-                        target_db_type="mongodb",
-                        columns=mi_fields,
-                        is_unique=mi.is_unique,
-                        extra={},
-                    ))
+                if found_by_cols:
+                    continue
+                if mi_sig in recommended_sigs:
+                    continue
+                mi_col_tuple_check = tuple(list(k.keys())[0] for k in mi.keys)
+                rec_covered = False
+                for rsig in recommended_sigs:
+                    rcols = tuple(c for c, _ in rsig)
+                    if rcols == mi_col_tuple_check:
+                        rec_covered = True
+                        break
+                if rec_covered:
+                    continue
+                mi_fields = [list(k.keys())[0] for k in mi.keys]
+                mi_directions = ["DESC" if list(k.values())[0] == -1 else "ASC" for k in mi.keys]
+                diffs.append(IndexDiff(
+                    action="drop_index",
+                    index_name=mi.name,
+                    target_db_type="mongodb",
+                    columns=mi_fields,
+                    is_unique=mi.is_unique,
+                    column_directions=mi_directions,
+                    extra={},
+                ))
 
         return diffs
 
@@ -387,50 +489,111 @@ class DiffEngine:
         self, mongo: MongoCollectionMetadata, pg: Optional[TableMetadata]
     ) -> List[IndexDiff]:
         diffs = []
-        pg_indexes = {}
-        if pg:
-            pg_indexes = {idx.name: idx for idx in pg.indexes}
 
+        pg_sig_map: Dict[tuple, Any] = {}
+        if pg:
+            for pidx in pg.indexes:
+                sig = self._make_index_signature(pidx.columns, pidx.column_directions)
+                pg_sig_map[sig] = pidx
+
+        mongo_sig_set: set = set()
         for mi in mongo.indexes:
             if mi.name.startswith("_id_"):
                 continue
+            mi_sig = self._mongo_keys_to_signature(mi.keys)
+            mongo_sig_set.add(mi_sig)
             mi_fields = [list(k.keys())[0] for k in mi.keys]
-            idx_name = self._normalize_index_name(mi.name, mongo.collection_name, "pg")
-            found = False
-            if pg:
-                for pidx in pg.indexes:
-                    if list(pidx.columns) == mi_fields:
-                        found = True
-                        break
-            if not found:
-                diffs.append(IndexDiff(
-                    action="add_index",
-                    index_name=idx_name,
-                    target_db_type="postgresql",
-                    columns=mi_fields,
-                    is_unique=mi.is_unique,
-                    extra={"original_mongo_name": mi.name, "ttl": mi.is_ttl, "expire_after_seconds": mi.expire_after_seconds},
-                ))
+            mi_directions = ["DESC" if list(k.values())[0] == -1 else "ASC" for k in mi.keys]
+
+            matching_pg = pg_sig_map.get(mi_sig)
+
+            if matching_pg is None:
+                matched_by_cols = None
+                if pg:
+                    mi_col_set = tuple(list(k.keys())[0] for k in mi.keys)
+                    for pidx in pg.indexes:
+                        if pidx.is_primary:
+                            continue
+                        if tuple(pidx.columns) == mi_col_set:
+                            matched_by_cols = pidx
+                            break
+
+                if matched_by_cols is not None:
+                    pg_sig = self._make_index_signature(matched_by_cols.columns, matched_by_cols.column_directions)
+                    diffs.append(IndexDiff(
+                        action="modify_index",
+                        index_name=matched_by_cols.name,
+                        target_db_type="postgresql",
+                        columns=mi_fields,
+                        is_unique=mi.is_unique,
+                        column_directions=mi_directions,
+                        extra={
+                            "change": "direction_mismatch",
+                            "current_sig": list(pg_sig),
+                            "expected_sig": list(mi_sig),
+                            "original_mongo_name": mi.name,
+                        },
+                    ))
+                else:
+                    idx_name = self._normalize_index_name(mi.name, mongo.collection_name, "pg")
+                    diffs.append(IndexDiff(
+                        action="add_index",
+                        index_name=idx_name,
+                        target_db_type="postgresql",
+                        columns=mi_fields,
+                        is_unique=mi.is_unique,
+                        column_directions=mi_directions,
+                        extra={"original_mongo_name": mi.name, "ttl": mi.is_ttl, "expire_after_seconds": mi.expire_after_seconds},
+                    ))
+            else:
+                if mi.is_unique and not matching_pg.is_unique:
+                    diffs.append(IndexDiff(
+                        action="modify_index",
+                        index_name=matching_pg.name,
+                        target_db_type="postgresql",
+                        columns=mi_fields,
+                        is_unique=True,
+                        column_directions=mi_directions,
+                        extra={"change": "add_uniqueness", "original_mongo_name": mi.name},
+                    ))
+                elif not mi.is_unique and matching_pg.is_unique:
+                    diffs.append(IndexDiff(
+                        action="modify_index",
+                        index_name=matching_pg.name,
+                        target_db_type="postgresql",
+                        columns=mi_fields,
+                        is_unique=False,
+                        column_directions=mi_directions,
+                        extra={"change": "remove_uniqueness", "original_mongo_name": mi.name},
+                    ))
 
         if pg:
             for pidx in pg.indexes:
                 if pidx.is_primary:
                     continue
-                found = False
+                pg_sig = self._make_index_signature(pidx.columns, pidx.column_directions)
+                if pg_sig in mongo_sig_set:
+                    continue
+                pg_col_tuple = tuple(pidx.columns)
+                found_by_cols = False
                 for mi in mongo.indexes:
-                    mi_fields = [list(k.keys())[0] for k in mi.keys]
-                    if list(pidx.columns) == mi_fields:
-                        found = True
+                    if mi.name.startswith("_id_"):
+                        continue
+                    mi_col_tuple = tuple(list(k.keys())[0] for k in mi.keys)
+                    if mi_col_tuple == pg_col_tuple:
+                        found_by_cols = True
                         break
-                if not found:
-                    diffs.append(IndexDiff(
-                        action="drop_index",
-                        index_name=pidx.name,
-                        target_db_type="postgresql",
-                        columns=list(pidx.columns),
-                        is_unique=pidx.is_unique,
-                        extra={"pg_index_type": pidx.index_type},
-                    ))
+                if found_by_cols:
+                    continue
+                diffs.append(IndexDiff(
+                    action="drop_index",
+                    index_name=pidx.name,
+                    target_db_type="postgresql",
+                    columns=list(pidx.columns),
+                    is_unique=pidx.is_unique,
+                    column_directions=list(pidx.column_directions),
+                    extra={"pg_index_type": pidx.index_type},
+                ))
 
         return diffs
 
@@ -451,11 +614,12 @@ class DiffEngine:
         self, pg: TableMetadata, mongo: Optional[MongoCollectionMetadata]
     ) -> List[ShardingDiff]:
         diffs = []
-        if not mongo or not mongo.is_time_series:
-            time_field = self.config.get_time_field()
-            granularity = self.config.get_granularity()
-            bucket_max_span = self.config.sync_config.time_series_config.get("bucket_max_span_seconds", 3600)
-            meta_field = self.config.get_meta_field()
+        time_field = self.config.get_time_field()
+        meta_field = self.config.get_meta_field()
+        granularity = self.config.get_granularity()
+        bucket_max_span = self.config.sync_config.time_series_config.get("bucket_max_span_seconds", 3600)
+
+        if not mongo:
             diffs.append(ShardingDiff(
                 action="create_timeseries",
                 target_db_type="mongodb",
@@ -466,61 +630,184 @@ class DiffEngine:
                     "bucket_max_span_seconds": bucket_max_span,
                 },
             ))
-        else:
-            expected_granularity = self.config.get_granularity()
-            if mongo.granularity and mongo.granularity != expected_granularity:
-                diffs.append(ShardingDiff(
-                    action="modify_granularity",
-                    target_db_type="mongodb",
-                    extra={
-                        "current": mongo.granularity,
-                        "expected": expected_granularity,
-                    },
-                ))
-            expected_bucket = self.config.sync_config.time_series_config.get("bucket_max_span_seconds", 3600)
-            if mongo.bucket_max_span_seconds and mongo.bucket_max_span_seconds != expected_bucket:
-                diffs.append(ShardingDiff(
-                    action="modify_bucket_span",
-                    target_db_type="mongodb",
-                    extra={
-                        "current": mongo.bucket_max_span_seconds,
-                        "expected": expected_bucket,
-                    },
-                ))
+            return diffs
+
+        if not mongo.is_time_series:
+            diffs.append(ShardingDiff(
+                action="collection_type_mismatch",
+                target_db_type="mongodb",
+                extra={
+                    "current_type": "regular",
+                    "expected_type": "timeseries",
+                    "collection": mongo.collection_name,
+                    "expected_time_field": time_field,
+                    "expected_meta_field": meta_field,
+                    "expected_granularity": granularity,
+                },
+            ))
+            return diffs
+
+        if mongo.time_field and mongo.time_field != time_field:
+            diffs.append(ShardingDiff(
+                action="modify_time_field",
+                target_db_type="mongodb",
+                extra={"current": mongo.time_field, "expected": time_field},
+            ))
+
+        if mongo.meta_field and mongo.meta_field != meta_field:
+            diffs.append(ShardingDiff(
+                action="modify_meta_field",
+                target_db_type="mongodb",
+                extra={"current": mongo.meta_field, "expected": meta_field},
+            ))
+
+        if mongo.granularity and mongo.granularity != granularity:
+            diffs.append(ShardingDiff(
+                action="modify_granularity",
+                target_db_type="mongodb",
+                extra={"current": mongo.granularity, "expected": granularity},
+            ))
+
+        if mongo.bucket_max_span_seconds and mongo.bucket_max_span_seconds != bucket_max_span:
+            diffs.append(ShardingDiff(
+                action="modify_bucket_span",
+                target_db_type="mongodb",
+                extra={"current": mongo.bucket_max_span_seconds, "expected": bucket_max_span},
+            ))
 
         buckets_config = self.config.sync_config.time_series_config.get("bucket_ranges", [])
-        if buckets_config and mongo:
-            configured_froms = {b.from_date for b in mongo.buckets}
+        if buckets_config:
+            configured_map: Dict[tuple, str] = {}
             for bc in buckets_config:
-                if bc.get("from", "") not in configured_froms:
+                key = (bc.get("from", ""), bc.get("to", ""))
+                configured_map[key] = bc.get("bucket_size", "")
+
+            existing_map: Dict[tuple, str] = {}
+            for b in mongo.buckets:
+                key = (b.from_date, b.to_date)
+                existing_map[key] = b.bucket_size
+
+            for key, expected_size in configured_map.items():
+                if key not in existing_map:
                     diffs.append(ShardingDiff(
                         action="add_bucket_range",
                         target_db_type="mongodb",
+                        extra={"from": key[0], "to": key[1], "bucket_size": expected_size},
+                    ))
+                elif existing_map[key] != expected_size:
+                    diffs.append(ShardingDiff(
+                        action="modify_bucket_range",
+                        target_db_type="mongodb",
                         extra={
-                            "from": bc.get("from", ""),
-                            "to": bc.get("to", ""),
-                            "bucket_size": bc.get("bucket_size", ""),
+                            "from": key[0],
+                            "to": key[1],
+                            "current_size": existing_map[key],
+                            "expected_size": expected_size,
                         },
                     ))
+
+            for key, current_size in existing_map.items():
+                if key not in configured_map:
+                    diffs.append(ShardingDiff(
+                        action="remove_bucket_range",
+                        target_db_type="mongodb",
+                        extra={"from": key[0], "to": key[1], "bucket_size": current_size},
+                    ))
+
+        if mongo.is_sharded:
+            expected_shard_key = self.config.sync_config.time_series_config.get("shard_key")
+            if expected_shard_key and mongo.shard_key != expected_shard_key:
+                diffs.append(ShardingDiff(
+                    action="shard_key_mismatch",
+                    target_db_type="mongodb",
+                    extra={"current": mongo.shard_key, "expected": expected_shard_key},
+                ))
+
         return diffs
 
     def _diff_sharding_mongo_to_pg(
         self, mongo: MongoCollectionMetadata, pg: Optional[TableMetadata]
     ) -> List[ShardingDiff]:
         diffs = []
-        if mongo.is_time_series:
-            time_field = mongo.time_field or self.config.get_time_field()
-            if pg and pg.primary_key_columns:
-                if time_field not in pg.primary_key_columns:
-                    diffs.append(ShardingDiff(
-                        action="add_partition_key",
-                        target_db_type="postgresql",
-                        extra={"time_field": time_field},
-                    ))
-            if pg is None:
+
+        if not mongo.is_time_series:
+            return diffs
+
+        time_field = mongo.time_field or self.config.get_time_field()
+
+        if pg is None:
+            diffs.append(ShardingDiff(
+                action="create_partitioned_table",
+                target_db_type="postgresql",
+                extra={
+                    "time_field": time_field,
+                    "meta_field": mongo.meta_field,
+                    "granularity": mongo.granularity,
+                },
+            ))
+            if mongo.buckets:
+                partition_ranges = []
+                for b in mongo.buckets:
+                    partition_ranges.append({
+                        "from": b.from_date,
+                        "to": b.to_date,
+                        "bucket_size": b.bucket_size,
+                    })
                 diffs.append(ShardingDiff(
-                    action="create_partitioned_table",
+                    action="create_time_partitions",
                     target_db_type="postgresql",
-                    extra={"time_field": time_field},
+                    extra={"time_field": time_field, "partition_ranges": partition_ranges},
                 ))
+            return diffs
+
+        has_partition_key = time_field in pg.primary_key_columns
+        if not has_partition_key:
+            diffs.append(ShardingDiff(
+                action="add_partition_key",
+                target_db_type="postgresql",
+                extra={"time_field": time_field},
+            ))
+
+        is_partitioned = False
+        for pidx in pg.indexes:
+            if pidx.is_primary and time_field in pidx.columns:
+                is_partitioned = True
+                break
+        if not is_partitioned and not has_partition_key:
+            diffs.append(ShardingDiff(
+                action="add_partition_key",
+                target_db_type="postgresql",
+                extra={"time_field": time_field},
+            ))
+
+        if mongo.buckets:
+            partition_ranges = []
+            for b in mongo.buckets:
+                partition_ranges.append({
+                    "from": b.from_date,
+                    "to": b.to_date,
+                    "bucket_size": b.bucket_size,
+                })
+            diffs.append(ShardingDiff(
+                action="create_time_partitions",
+                target_db_type="postgresql",
+                extra={"time_field": time_field, "partition_ranges": partition_ranges},
+            ))
+
+        if mongo.is_sharded and mongo.shard_key:
+            shard_fields = list(mongo.shard_key.keys())
+            pg_idx_covers_shard = False
+            for pidx in pg.indexes:
+                if pidx.is_primary:
+                    continue
+                if all(f in pidx.columns for f in shard_fields):
+                    pg_idx_covers_shard = True
+                    break
+            if not pg_idx_covers_shard:
+                diffs.append(ShardingDiff(
+                    action="add_shard_key_index",
+                    target_db_type="postgresql",
+                    extra={"shard_key": mongo.shard_key, "shard_fields": shard_fields},
+                ))
+
         return diffs
